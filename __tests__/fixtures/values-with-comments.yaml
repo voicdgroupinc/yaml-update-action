@@ -1,0 +1,1014 @@
+clusters:
+  corporate-east-1:
+    id: 8b16f9fe-6096-4e1b-94ee-ee9a79bfd4a8
+    name: c111.us-east.containers.cloud.ibm.com
+  prod-us-east-1:
+    id: 27f94595-e208-4f88-8035-e997a0df09d8
+    name: oauth-openshift.apps.us-east-1.voicd.app
+targetCluster: 8b16f9fe-6096-4e1b-94ee-ee9a79bfd4a8
+deploymentEnabled: true
+environment: prod
+customer: ''
+deployment: ''
+namespaceOverride: ''
+localvaults: []
+# Shared bits rendered into every deployment namespace.
+general:
+  ibmCloudSecret:
+    # The `ibm-cloud` Secret (templates/general/secret.yaml). Default true purely
+    # to preserve existing behaviour — it holds IBM COS credentials committed to
+    # git and is consumed by nothing. Set false for any deployment that must not
+    # hold production credentials.
+    enabled: true
+defaultNodeGroup: general
+nodeGroups:
+  any: {}
+  general:
+    avoidGpuNodes: true
+  voicd-services:
+    nodeSelector:
+      voicd.app/node-group: voicd-services
+    tolerations:
+      - key: voicd.app/node-group
+        operator: Equal
+        value: voicd-services
+        effect: NoSchedule
+  gpu:
+    nodeSelector:
+      voicd.app/node-group: gpu
+    tolerations:
+      - key: nvidia.com/gpu
+        operator: Equal
+        value: 'true'
+        effect: NoSchedule
+    gpuCount: 1
+  # ARCH-557: GPU pools that differ only in how much VRAM one nvidia.com/gpu
+  # slot is worth. Time-slicing splits a card into N schedulable slots with NO
+  # memory isolation, so the split IS the per-pod budget — pick the pool by what
+  # the workload needs to keep resident:
+  #
+  #   gpu          1x L4   24GB / 4   ->  4 slots/node, ~5.6 GiB per slot
+  #   gpu-2l4-2    2x L4   24GB / 2   ->  4 slots/node, ~11.25 GiB per slot
+  #   gpu-l40s-4   1x L40S 48GB / 4   ->  4 slots/node, ~11.25 GiB per slot
+  #   gpu-l40s-2   1x L40S 48GB / 2   ->  2 slots/node, ~22.5 GiB per slot
+  #
+  # The slot count is per physical card, not per node, which is why the 2x L4
+  # profile at a 2-way split lands on the same slot size as the 1x L40S at a
+  # 4-way split — gpu-2l4-2 is the L4-priced twin of gpu-l40s-4, and a usable
+  # fallback when L40S spot capacity is not available in a zone.
+  #
+  # The boundaries come from measurement (ARCH-558 — every ModelAgent job type
+  # probed at 5ms through the real analyzer path), not from round numbers.
+  # Peak MiB at 60s of audio, including a ~609 MiB CUDA context:
+  #
+  #   A_SA_SUITE (full ASR stack)  14,823   -> gpu-l40s-2 only
+  #   A_ER_EMOTION_RECOG           10,224   -> ~11 GiB slot, with little to spare
+  #   A_SA_ASR_WHISPERX             8,657   -> ~11 GiB slot
+  #   A_SA_ASR_WHISPER              7,509   -> ~11 GiB slot
+  #   A_DF_DEEPFAKE_DETECTION       3,197   -> the 5.6 GiB `gpu` pool is right
+  #   A_SV_* speaker verification   1,823-2,199
+  #
+  # So `gpu` is not obsolete: deepfake and speaker verification are what prod
+  # actually serves today, and putting them in an 11 GiB slot wastes most of it.
+  #
+  # Two traps when sizing against that table. ModelAgent never releases a loaded
+  # model (global.cleanup_model_memory is false), so a pod serving several job
+  # types holds the SUM of their footprints — size against the job types routed
+  # to the pool. And A_ER_EMOTION_RECOG grows ~3.7x per doubling of clip length
+  # (no chunking, eager attention — ARCH-563), so its 10,224 MiB figure holds at
+  # 60s and not beyond; a 120s clip does not fit any slot here.
+  #
+  # The nvidia.com/device-plugin.config selector is doing real work, not
+  # decoration: it is the label the GPU operator reads to decide which slicing
+  # profile a node runs, and OpsPortal applies each pool's labels FROM this same
+  # nodeSelector map. Emitting it on the pod as well is what guarantees a pod
+  # cannot land on a node running the other split. Keep the two in step with the
+  # keys in the device-plugin ConfigMap (ai-accelerator, gpu-operator-certified
+  # instance base) — a selector naming a profile that does not exist there
+  # leaves pods Pending against nodes whose device plugin never came up.
+  gpu-l40s-4:
+    nodeSelector:
+      voicd.app/node-group: gpu-l40s-4
+      nvidia.com/device-plugin.config: time-sliced-4
+    tolerations:
+      - key: nvidia.com/gpu
+        operator: Equal
+        value: 'true'
+        effect: NoSchedule
+    gpuCount: 1
+  gpu-l40s-2:
+    nodeSelector:
+      voicd.app/node-group: gpu-l40s-2
+      nvidia.com/device-plugin.config: time-sliced-2
+    tolerations:
+      - key: nvidia.com/gpu
+        operator: Equal
+        value: 'true'
+        effect: NoSchedule
+    gpuCount: 1
+  gpu-2l4-2:
+    nodeSelector:
+      voicd.app/node-group: gpu-2l4-2
+      nvidia.com/device-plugin.config: time-sliced-2
+    tolerations:
+      - key: nvidia.com/gpu
+        operator: Equal
+        value: 'true'
+        effect: NoSchedule
+    gpuCount: 1
+postgresql:
+  enabled: true
+  nodeGroup: ''
+  database_service_name: postgresql
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: 2000m
+      memory: 2Gi
+  memory_limit: 512Mi
+  config:
+    postgresql_database: voicdops
+    postgresql_password: postgresql
+    postgresql_user: postgresql
+    port: 5432
+  image:
+    repository: registry.redhat.io/rhel8/postgresql-13
+    pullPolicy: IfNotPresent
+    tag: latest
+  pvc:
+    volume_capacity: 10Gi
+    ibm_cloud: true
+rabbitmq:
+  enabled: true
+  nodeGroup: ''
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: 3000m
+      memory: 2Gi
+  tls:
+    enabled: false
+nominatim:
+  enabled: false
+  nodeGroup: ''
+  image:
+    repository: docker.io/mediagis/nominatim
+    tag: '5.3'
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 1000m
+      memory: 4Gi
+    limits:
+      cpu: 4000m
+      memory: 8Gi
+  shmSize: 1Gi
+  pvc:
+    volume_capacity: 30Gi
+    storageClass: ''
+  config:
+    pbf_url: ''
+    replication_url: ''
+    update_mode: ''
+    password: nominatim
+geocoderservice:
+  enabled: false
+  nodeGroup: ''
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  image:
+    repository: image-registry.openshift-image-registry.svc:5000/voicdops-images/geocoderservice
+    tag: latest
+    pullPolicy: Always
+  config:
+    nominatimUrl: ''
+    nominatimUserAgent: ''
+  streetNames: ''
+  streetNamesRefresh:
+    enabled: false
+    schedule: 17 3 * * *
+modelagent:
+  enabled: true
+  replicaCount: 1
+  exposure: ''
+  nodeGroup: any
+  gpu:
+    enabled: true
+  resources:
+    limits:
+      cpu: 4000m
+      memory: 18Gi
+      # Bounds the pod's own disk use so a runaway cache evicts this pod instead
+      # of pushing the whole node past the kubelet threshold and taking its
+      # neighbours with it (ARCH-602).
+      ephemeral-storage: 8Gi
+    requests:
+      cpu: 2000m
+      memory: 2Gi
+      # Without this the scheduler sees "ephemeral-storage 0 (0%)" and will pack
+      # replicas onto a node that has no disk left for them.
+      ephemeral-storage: 2Gi
+  image:
+    repository: image-registry.openshift-image-registry.svc:5000/voicdops-images/modelagent
+    tag: v1.0.115
+    pullPolicy: Always
+  service:
+    port: 8080
+    targetPort: 8080
+  filestore:
+    localvaultName: ''
+    mountPath: /app/filestore
+    # Where the model cache lives. HF_HOME sits under this mount and each
+    # replica pulls ~12 GiB into it, so on a 4-replica GPU node an emptyDir put
+    # ~48 GiB on the node's 99 GiB disk and the kubelet evicted a pod for
+    # ephemeral-storage pressure (ARCH-602). A generic ephemeral volume gives
+    # each replica its own PVC with the pod's lifetime -- same
+    # create-and-destroy semantics as the emptyDir, but the cache never touches
+    # the node's disk. Ignored when localvaultName pins a shared claim.
+    ephemeral:
+      enabled: true
+      size: 20Gi
+      # Empty means the cluster default StorageClass.
+      storageClassName: ''
+  models:
+    s3Endpoint: ''
+  route:
+    routeName: c111-e.us-east.containers.cloud.ibm.com
+  sidecars:
+    visionboard:
+      enabled: true
+      image: image-registry.openshift-image-registry.svc:5000/voicdops-images/visionboard-sidecar
+      tag: latest
+      pullPolicy: Always
+      resources:
+        requests:
+          cpu: 50m
+          memory: 128Mi
+    datavault:
+      enabled: true
+      image: image-registry.openshift-image-registry.svc:5000/voicdops-images/datavault-sidecar
+      tag: latest
+      pullPolicy: Always
+      resources:
+        requests:
+          cpu: 50m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+      socketPath: /shared/ipc/datavault.sock
+      args:
+        - '--ipc-mode'
+        - '--ipc-socket-path'
+        - /shared/ipc/datavault.sock
+        - '--filestore-base-path'
+        - /app/filestore
+        - '--filestore-vault-dir'
+        - vault
+        - '--filestore-temp-dir'
+        - /app/filestore/tmp
+    queuebroker:
+      enabled: true
+      image: image-registry.openshift-image-registry.svc:5000/voicdops-images/queuebroker-sidecar
+      tag: latest
+      pullPolicy: Always
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 1000m
+          memory: 1Gi
+      socketPath: /shared/ipc/queuebroker.sock
+      processing:
+        mode: queue
+        queue:
+          prefetchCount: 1
+          bufferSize: 1
+          ipcRecvTimeoutMs: 25000
+        rabbitmq:
+          host: rabbitmq
+          port: 5672
+    sourceafis:
+      enabled: false
+      image: image-registry.openshift-image-registry.svc:5000/voicdops-images/sourceafis-sidecar
+      tag: latest
+      pullPolicy: Always
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 2000m
+          memory: 2Gi
+      socketPath: /shared/ipc/sourceafis.sock
+queuebroker:
+  enabled: true
+  nodeGroup: ''
+  exposure: ''
+  replicaCount: 1
+  resources:
+    limits:
+      cpu: 8000m
+      memory: 4Gi
+    requests:
+      cpu: 1000m
+      memory: 1Gi
+  image:
+    repository: image-registry.openshift-image-registry.svc:5000/voicdops-images/queuebroker
+    tag: v1.0.44
+    pullPolicy: Always
+  service:
+    port: 8080
+    targetPort: 8080
+  route:
+    routeName: c111-e.us-east.containers.cloud.ibm.com
+  filestore:
+    localvaultName: ''
+    mountPath: /app/filestore
+  processing:
+    mode: queue
+    queue:
+      prefetchCount: 1
+      bufferSize: 1
+      ipcRecvTimeoutMs: 25000
+    eda:
+      websocket:
+        enabled: true
+        path: /ws
+      clientUid:
+        generateIfMissing: true
+        perClientQueueTtlMs: 604800000
+    rabbitmq:
+      host: rabbitmq
+      port: 5672
+    streamchannel:
+      baseUrl: ''
+visionboard:
+  enabled: false
+  nodeGroup: ''
+  exposure: ''
+  replicaCount: 1
+  resources:
+    limits:
+      cpu: 2000m
+      memory: 2Gi
+    requests:
+      cpu: 250m
+      memory: 500Mi
+  image:
+    repository: image-registry.openshift-image-registry.svc:5000/voicdops-images/visionboard
+    tag: v1.0.7
+    pullPolicy: Always
+  service:
+    port: 8080
+    targetPort: 8080
+  route:
+    routeName: c111-e.us-east.containers.cloud.ibm.com
+datavault:
+  enabled: false
+  nodeGroup: ''
+  exposure: ''
+  replicaCount: 1
+  resources:
+    limits:
+      cpu: 2000m
+      memory: 2Gi
+    requests:
+      cpu: 250m
+      memory: 500Mi
+  image:
+    repository: image-registry.openshift-image-registry.svc:5000/voicdops-images/datavault
+    tag: v1.0.35
+    pullPolicy: Always
+  service:
+    port: 8080
+    targetPort: 8080
+    sftpPort: 2022
+    sftpExpose: public
+  filestore:
+    localvaultName: ''
+    mountPath: /app/filestore
+  vault:
+    name: ''
+    backendType: s3
+    endpoint: ''
+    region: ''
+    secretName: datavault-storage
+    buckets: []
+  eda:
+    host: rabbitmq
+    port: 5672
+    user: datavault
+    vhost: /
+    passwordSecret: datavault-eda
+    passwordSecretKey: eda-password
+    password: ''
+  route:
+    routeName: c111-e.us-east.containers.cloud.ibm.com
+    timeout: 300s
+  lakehouse:
+    enabled: false
+    catalog:
+      jdbcUrl: ''
+      jdbcUser: iceberg
+      jdbcPassword: iceberg
+      warehouseBase: s3a://warehouse/
+    spark:
+      mode: connect
+      masterUrl: ''
+      driverMemory: 2g
+      executorMemory: 4g
+      executorInstances: 2
+    trino:
+      enabled: false
+      endpoint: ''
+      catalogName: iceberg
+      user: datavault
+streamchannel:
+  enabled: false
+  nodeGroup: ''
+  mode: intra
+  replicaCount: 1
+  image:
+    repository: image-registry.openshift-image-registry.svc:5000/voicdops-images/streamchannel
+    tag: v0.1.8
+    pullPolicy: Always
+  resources:
+    limits:
+      cpu: '4'
+      memory: 2Gi
+    requests:
+      cpu: 500m
+      memory: 512Mi
+  auth:
+    # The QueueBroker a_token, consumed as a secretKeyRef (SC_A_TOKEN) — never a
+    # chart value, so it does not land in git. The chart renders no Secret: for an
+    # OpsPortal-managed deployment OpsPortal pushes it into the namespace, the same
+    # split as datavault-storage and rabbitmq-keda. A hand-written overlay (e.g.
+    # corporate/dev-lakehouse) must create it by hand, or streamchannel sits in
+    # CreateContainerConfigError and holds up the sync (ARCH-638).
+    aTokenSecret: streamchannel-atoken
+    aTokenSecretKey: a-token
+  queuebroker:
+    host: queuebroker
+    port: 8080
+  rabbitmq:
+    host: rabbitmq
+    port: 5672
+  extra:
+    queuebroker:
+      host: ''
+    rabbitmq:
+      host: ''
+    aTokenSecret: streamchannel-extra-atoken
+    aTokenSecretKey: a-token
+  ingest:
+    rtpPort: 30000
+    healthPort: 8080
+  uidScope: channel
+  segmentation:
+    targetMs: 5000
+    minMs: 3000
+    maxMs: 12000
+    silenceHangoverMs: 240
+    tailFloorMs: 1000
+    vad: webrtc
+    vadThreshold: 0.4
+  backpressure:
+    policy: buffer
+    sampleEveryN: 2
+  retention:
+    segmentTtlSeconds: 3600
+    sweepIntervalSeconds: 300
+  channels: []
+  sidecars:
+    datavault:
+      enabled: true
+      image: image-registry.openshift-image-registry.svc:5000/voicdops-images/datavault-sidecar
+      tag: latest
+      pullPolicy: Always
+      resources:
+        requests:
+          cpu: 50m
+          memory: 128Mi
+      socketPath: /shared/ipc/datavault.sock
+      args:
+        - '--ipc-mode'
+        - '--ipc-socket-path'
+        - /shared/ipc/datavault.sock
+        - '--filestore-base-path'
+        - /app/filestore
+        - '--filestore-vault-dir'
+        - vault
+        - '--filestore-temp-dir'
+        - /app/filestore/tmp
+  filestore:
+    localvaultName: ''
+    mountPath: /app/filestore
+  siprec:
+    # SIPREC is StreamChannel Phase 2 and nothing runs it yet — dev-lakehouse turns
+    # it off explicitly, pvitl-uat has streamchannel off entirely. Left on, it is
+    # gated only on `streamchannel.enabled`, so enabling the component brings up
+    # drachtio (SIP, expose: public), srs-app, rtpengine on hostNetwork and a
+    # LoadBalancer Service for SIP — a billed public IP per namespace. That was
+    # tolerable while streamchannel was off everywhere; it is not now that OpsPortal
+    # enables it by default (ARCH-625). Opt in per deployment when SIP is wanted.
+    enabled: false
+    drachtio:
+      image: drachtio/drachtio-server
+      tag: latest
+      pullPolicy: IfNotPresent
+      resources:
+        requests:
+          cpu: 50m
+          memory: 128Mi
+      sipPort: 5060
+      adminPort: 9022
+      secretRef: streamchannel-drachtio
+      expose: public
+    srsApp:
+      image: image-registry.openshift-image-registry.svc:5000/voicdops-images/streamchannel-srs
+      tag: v0.1.0
+      pullPolicy: Always
+      resources:
+        requests:
+          cpu: 50m
+          memory: 128Mi
+    rtpengine:
+      enabled: true
+      image: image-registry.openshift-image-registry.svc:5000/voicdops-images/rtpengine
+      tag: latest
+      pullPolicy: IfNotPresent
+      replicaCount: 1
+      hostNetwork: true
+      serviceAccount: streamchannel-rtpengine
+      portMin: 30000
+      portMax: 40000
+      ngPort: 22222
+      # What rtpengine advertises in SDP. Empty = the node's own address, which
+      # is wrong behind NAT: the call sets up and then carries no audio. Media
+      # rides hostNetwork on portMin-portMax to the node, NEVER the SIP LB (the
+      # LB listens only on 5060, and VPC NLB has no port-range listeners), so
+      # this and the VPC rules are the whole media path. OpsPortal refuses to
+      # publish SIP without it (ARCH-626).
+      #
+      # ARCH-632: set this to the FLOATING IP attached to the rtpengine node.
+      # rtpengine binds $(NODE_IP) and advertises this (bind!advertise) — it is
+      # never bound, so a NAT'd FIP is fine. Riders: the FIP lives on one node,
+      # so the pod must be pinned there and replicaCount must stay 1; that
+      # node's security group needs portMin-portMax/udp open. On-VPC/private
+      # callers need none of this — leave it empty and the node IP is correct.
+      publicAddress: ''
+      resources:
+        limits:
+          cpu: '2'
+          memory: 1Gi
+        requests:
+          cpu: 250m
+          memory: 256Mi
+spark:
+  enabled: false
+  nodeGroup: ''
+  mode: connect
+  image:
+    repository: apache/spark
+    tag: 3.5.8
+    pullPolicy: IfNotPresent
+  connect:
+    port: 15002
+  ui:
+    port: 4040
+  resources:
+    limits:
+      cpu: '2'
+      memory: 4Gi
+    requests:
+      cpu: 500m
+      memory: 2Gi
+  iceberg:
+    jarUrl: ''
+trino:
+  enabled: false
+  nodeGroup: ''
+  image:
+    repository: trinodb/trino
+    tag: '443'
+    pullPolicy: IfNotPresent
+  service:
+    port: 8080
+  resources:
+    limits:
+      cpu: '2'
+      memory: 8Gi
+    requests:
+      cpu: 500m
+      memory: 2Gi
+  catalog:
+    icebergConnector:
+      warehousePath: s3a://warehouse/
+  jvm:
+    maxHeapSize: 4G
+lakehouse:
+  objectStorage:
+    provider: minio
+    endpoint: ''
+    region: us-east-1
+    pathStyleAccess: true
+    secret:
+      name: cos-credentials
+      accessKeyField: access-key
+      secretKeyField: secret-key
+    credentials:
+      accessKey: ''
+      secretKey: ''
+minio:
+  enabled: false
+  nodeGroup: ''
+  image:
+    repository: minio/minio
+    tag: latest
+  service:
+    apiPort: 9000
+    consolePort: 9001
+  credentials:
+    accessKey: minioadmin
+    secretKey: minioadmin
+  pvc:
+    size: 50Gi
+    ibm_cloud: true
+icebergCatalog:
+  enabled: false
+  nodeGroup: ''
+  image:
+    repository: registry.redhat.io/rhel8/postgresql-13
+    tag: latest
+  config:
+    database: iceberg_catalog
+    user: iceberg
+    password: iceberg
+    port: 5432
+  pvc:
+    size: 5Gi
+    ibm_cloud: true
+rbac:
+  roleName: admin
+  groupName: developers
+routes:
+  domains: []
+  domain: ''
+  defaultDomain: ''
+  internalDomain: ''
+  externalTarget: ''
+  hstsHeader: max-age=31536000
+  defaultExposure: internal
+  # ARCH-568: whether a public route's Cloudflare record is PROXIED (orange
+  # cloud) rather than DNS-only. A cluster-wide fact — it answers "does this
+  # cluster's public router sit behind Cloudflare", which is true for every
+  # route on that router or for none of them.
+  #
+  # Off by default. Turning it on is a PREREQUISITE for restricting the public
+  # router's load balancer to Cloudflare's ranges, not a consequence of it:
+  # proxy first, verify, then restrict. Restricting while a route is still
+  # DNS-only leaves it resolving to an address that refuses the connection.
+  #
+  # ⚠️ Two Cloudflare edge limits apply the moment this is on, and neither is
+  # visible until something hits them:
+  #   * origin timeout is 100s on Free/Pro (524 after that), regardless of the
+  #     haproxy.router.openshift.io/timeout the route asks for;
+  #   * request bodies are capped at 100 MB on Free/Pro.
+  # Both are raisable only on Enterprise. A service needing long requests or
+  # large uploads cannot be external on a proxied cluster without that.
+  cloudflareProxied: false
+  certIssuer:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+    group: cert-manager.io
+kanidm:
+  enabled: false
+  hostname: sso.voicd.ai
+  logLevel: info
+  image:
+    repository: image-registry.openshift-image-registry.svc:5000/voicdops-images/kanidm
+    tag: v1.11.0-adminui.2
+    pullPolicy: Always
+  pvc:
+    size: 10Gi
+    storageClass: ibmc-vpc-block-10iops-tier
+  # Readiness path (ARCH-576). Readiness decides whether a pod joins the `kanidm`
+  # Service, and /status answers 200 on a node that is running but holds an EMPTY
+  # database — so a scaled-out replica takes SSO traffic ~15s after boot, before
+  # the cert exchange has run.
+  #
+  # Leave this at /status for normal operation and for any FIRST install: a fresh
+  # deployment has no OAuth2 clients, so a data-aware path would never answer 200
+  # and the pod would never become Ready.
+  #
+  # For a scale-out of an already-populated cluster, set it to a path that only
+  # answers 200 once the node holds data, e.g.
+  #   /oauth2/openid/openshift/.well-known/openid-configuration
+  # which keeps the new replica out of the Service until replication has synced,
+  # then put it back. See Module_Kanidm, "Scaling replicas in and out".
+  # Readiness decides Service membership, and /status answers 200 on a running but
+  # EMPTY node — so a scaled-out replica takes SSO traffic ~15s after boot, before
+  # its certs are exchanged. Point this at a data-aware path (e.g.
+  # /oauth2/openid/openshift/.well-known/openid-configuration) for the duration of a
+  # scale-out to keep an unsynced replica out of the Service, then put it back.
+  #
+  # It MUST be /status at rest. Two reasons: a first install has no OAuth2 clients,
+  # so a data-aware path never answers 200 and no pod ever becomes Ready; and with
+  # podManagementPolicy OrderedReady a permanently-unready highest ordinal blocks
+  # every rolling update to the pods below it (ARCH-578).
+  readinessPath: /status
+  # ARCH-576: limits doubled from 1 CPU / 512Mi. A replication refresh pulls and
+  # applies the full database in one go, and a mesh node also serves live auth
+  # while replicating incrementally with every peer — both spike well above steady
+  # state. Requests are unchanged: they drive scheduling, and the steady-state
+  # footprint has not moved.
+  #
+  # A too-low CPU limit is the more dangerous half. Throttling stretches the work
+  # that allocates, so transient memory outruns GC and the container OOMs at a
+  # limit its steady state sits comfortably under — see ARCH-574, where kuadrant
+  # died repeatedly at 300Mi and then settled at 142 MiB once CPU was raised.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: '2'
+      memory: 1Gi
+  certIssuer:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+    group: cert-manager.io
+  backup:
+    enabled: true
+    schedule: '@daily'
+    versions: 7
+  # ARCH-576: 3 replicas, one per AZ, so SSO survives losing a zone. The ARCH-571
+  # zone spread (maxSkew 1 on topology.kubernetes.io/zone) does the placing —
+  # us-east-2 holds none today, so kanidm-2 lands there.
+  #
+  # Scaling this is a procedure, not a dial: the new node boots with an empty
+  # database and needs the cert exchange run across all three before it holds
+  # data. See Module_Kanidm, "Scaling replicas in and out".
+  replicas: 3
+  replication:
+    enabled: false
+    # ARCH-578: keeps kanidm-repl-certs in step with the running nodes so replicas
+    # can be scaled in and out without anyone running the cert exchange by hand.
+    # Reads every node's replication cert, and only acts when the set actually
+    # changes — a node's cert comes from its on-disk identity and is stable across
+    # restarts, so a healthy cluster is a no-op and there is no restart loop.
+    # Fails closed: an unreachable node leaves the ConfigMap untouched rather than
+    # publishing a partial set that would drop a partner block on next restart.
+    certReconciler:
+      enabled: true
+      schedule: '*/5 * * * *'
+      # The cluster-provided oc image; always present, no external pull.
+      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+  cosBackup:
+    enabled: false
+    bucket: voicd-kanidm-backups
+    endpoint: https://s3.direct.us-east.cloud-object-storage.appdomain.cloud
+    region: us-east
+    image: amazon/aws-cli:latest
+    intervalSeconds: 3600
+    secretName: kanidm-cos-backup
+  route:
+    timeout: 60s
+  publicLoadBalancer:
+    enabled: false
+    ipType: public
+  # ARCH-567: peers kanidmd may believe an X-Forwarded-For header from. Empty
+  # means kanidmd uses the socket peer, which behind the public LB is always a
+  # SNAT address (100.64.0.0/10) and tells you nothing about the caller.
+  #
+  # Set to ["100.64.0.0/10"] to read Cloudflare's forwarded client address —
+  # but ONLY once the LB is restricted to Cloudflare's ranges by a security
+  # group in voicd-terraform. Until then anyone who can reach the LB can forge
+  # the address kanidmd keys rate limiting and lockout on. Deliberately not a
+  # list of Cloudflare ranges: trust is evaluated against the immediate peer,
+  # and the peer is the load balancer, never Cloudflare.
+  trustedProxyRanges: []
+samlBridge:
+  enabled: false
+  hostname: saml.voicd.ai
+  logLevel: info
+  image:
+    repository: image-registry.openshift-image-registry.svc:5000/voicdops-images/saml-bridge
+    tag: saml-bridge-v0.1.0
+    pullPolicy: Always
+  replicas: 2
+  podAntiAffinity: preferred
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 128Mi
+  certIssuer:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+    group: cert-manager.io
+  route:
+    timeout: 60s
+  externalDns:
+    enabled: true
+    target: ingress.us-east-1.voicd.ai
+  oidc:
+    issuerUrl: https://sso.voicd.ai/oauth2/openid/saml-bridge
+    clientId: saml-bridge
+  sp:
+    entityId: ''
+    acsUrl: ''
+    displayName: Huntress
+    loginUrl: ''
+  signaturePlacement: assertion
+  assertionValiditySecs: 300
+  sessionValiditySecs: 28800
+  allowedEmailDomains:
+    - voicd.com
+grafana:
+  enabled: false
+  hostname: metrics.us-east-1.voicd.ai
+  externalDnsTarget: ingress.us-east-1.voicd.ai
+  image:
+    repository: image-registry.openshift-image-registry.svc:5000/voicdops-images/grafana
+    tag: v13.1.2
+    pullPolicy: Always
+  pvc:
+    size: 5Gi
+    storageClass: ibmc-vpc-block-10iops-tier
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: '8'
+      memory: 4Gi
+  certIssuer:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+    group: cert-manager.io
+  route:
+    timeout: 1h
+  oidc:
+    clientId: grafana
+    authUrl: https://sso.voicd.ai/ui/oauth2
+    tokenUrl: https://sso.voicd.ai/oauth2/token
+    apiUrl: https://sso.voicd.ai/oauth2/openid/grafana/userinfo
+    secretName: grafana-oidc
+    groupRoleMap:
+      grafanaAdmin: 4db65f27-144e-4f48-ab0b-3259b97cb926
+      admin: 0ef51079-5502-4d02-9321-a49f75f310a0
+      editor: 7234fd89-9499-48d4-b352-0a189a4b78db
+      viewer: b6cfd33f-b00a-49b3-bc52-231067e877d4
+  adminSecretName: grafana-admin
+  userFolders:
+    - Ad hoc
+  rsearch:
+    enabled: true
+    url: https://rsearch.voicdops-logging.svc:9200
+    secretName: grafana-rsearch
+  prometheus:
+    enabled: true
+    url: https://thanos-querier.openshift-monitoring.svc:9091
+  opsportalMetrics:
+    enabled: true
+    url: timescaledb.voicdops-opsportal.svc:5432
+    database: opsportal_metrics
+    secretName: grafana-opsportal-metrics
+  security:
+    disableLoginForm: false
+rsearch:
+  enabled: false
+  image:
+    repository: image-registry.openshift-image-registry.svc:5000/voicdops-images/rsearch
+    tag: git-f62e51dfac49bf066f77450febd3eaa9022a6866
+    pullPolicy: Always
+  replicas: 3
+  pvc:
+    size: 150Gi
+    storageClass: ibmc-vpc-block-10iops-tier
+  resources:
+    requests:
+      cpu: '2'
+      memory: 4Gi
+    limits:
+      cpu: '8'
+      memory: 16Gi
+  cluster:
+    replicationFactor: 2
+    writeQuorum: 0
+  search:
+    cacheMaxMb: 8192
+  ingest:
+    memoryBudgetMb: 256
+    maxBatchDocs: 100000
+    balanceBulk: true
+  control:
+    # Merge target (#49): splits below this keep merging and each group is
+    # cut once it crosses, so outputs leave the candidate set. Replaces the
+    # deprecated mergeMinMb, which was a ceiling and let 68 MB archive
+    # flushes accumulate forever. Group of 8 crosses 512 MB in one pass.
+    mergeTargetMb: 512
+    mergeMaxGroup: 8
+  inputs:
+    syslog:
+      enabled: false
+    gelf:
+      enabled: false
+  route:
+    timeout: 60s
+  monitoring:
+    enabled: true
+    interval: 30s
+    scrapeTimeout: 10s
+    credentialsSecret: rsearch-vector-credentials
+    alerts:
+      enabled: true
+      queueDepth: 25000
+      walOutstanding: 50000
+      memoryHighRatio: 0.85
+      memoryCriticalRatio: 0.95
+      volumeFreeRatio: 0.15
+  metastore:
+    secretName: rsearch-postgresql
+  # Automatic user bootstrap (templates/rsearch/bootstrap-users-job.yaml).
+  #
+  # OFF by default so every existing deployment renders unchanged. Turning it on
+  # closes rSearch's bootstrap window automatically instead of relying on someone
+  # running the runbook curl commands: until a first user exists, EVERY endpoint
+  # is unauthenticated full-admin, on a cluster where the API Route already
+  # exists.
+  #
+  # Requires an out-of-band Secret (never in git) with `admin-password` and
+  # `service-password`:
+  #   oc create secret generic rsearch-bootstrap -n <ns> \
+  #     --from-literal=admin-password="$(openssl rand -base64 24)" \
+  #     --from-literal=service-password="$(openssl rand -base64 24)"
+  #
+  # serviceUser defaults to `elastic` on purpose: PVITL's
+  # config/initializers/elasticsearch.rb hardcodes `user: 'elastic'` and reads
+  # only ELASTIC_PASSWORD, so renaming it would need an app change.
+  bootstrap:
+    enabled: false
+    secretName: rsearch-bootstrap
+    serviceUser: elastic
+  postgresql:
+    image: docker.io/library/postgres:18.3-alpine
+    storage: 20Gi
+    storageClass: ibmc-vpc-block-10iops-tier
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: '1'
+        memory: 1Gi
+  ui:
+    enabled: true
+    image:
+      repository: image-registry.openshift-image-registry.svc:5000/voicdops-images/rsearch-ui
+      tag: git-f62e51dfac49bf066f77450febd3eaa9022a6866
+      pullPolicy: Always
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    route:
+      timeout: 60s
+  archive:
+    enabled: false
+    bucket: voicdops-logs-archive-us-east-1
+    endpoint: https://s3.direct.us-east.cloud-object-storage.appdomain.cloud
+    region: us-east
+    secretName: rsearch-cos-archive
+    ingest:
+      memoryBudgetMb: 128
+      queueCapacity: 20000
+    pvc:
+      size: 50Gi
+      storageClass: ibmc-vpc-block-10iops-tier
+    resources:
+      requests:
+        cpu: '1'
+        memory: 1Gi
+      limits:
+        cpu: '4'
+        memory: 12Gi
